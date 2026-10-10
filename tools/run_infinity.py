@@ -45,13 +45,13 @@ def encode_prompt(text_tokenizer, text_encoder, prompt, enable_positive_prompt=F
     tokens = text_tokenizer(text=captions, max_length=512, padding='max_length', truncation=True, return_tensors='pt')  # todo: put this into dataset
     input_ids = tokens.input_ids.cuda(non_blocking=True)
     mask = tokens.attention_mask.cuda(non_blocking=True)
-    text_features = text_encoder(input_ids=input_ids, attention_mask=mask)['last_hidden_state'].float()
+    text_features = text_encoder(input_ids=input_ids, attention_mask=mask)['last_hidden_state'].float() # (B, N, D) -> Text embedding.
     lens: List[int] = mask.sum(dim=-1).tolist()
     cu_seqlens_k = F.pad(mask.sum(dim=-1).to(dtype=torch.int32).cumsum_(0), (1, 0))
     Ltext = max(lens)    
     kv_compact = []
-    for len_i, feat_i in zip(lens, text_features.unbind(0)):
-        kv_compact.append(feat_i[:len_i])
+    for len_i, feat_i in zip(lens, text_features.unbind(0)): # Unbind the batch dimension and iterate over each sample in the batch.
+        kv_compact.append(feat_i[:len_i]) # Causal left-to-right text embedding, only keep the valid tokens for each sample.
     kv_compact = torch.cat(kv_compact, dim=0)
     text_cond_tuple = (kv_compact, lens, cu_seqlens_k, Ltext)
     return text_cond_tuple

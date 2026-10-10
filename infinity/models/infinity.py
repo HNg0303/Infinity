@@ -49,6 +49,7 @@ class TextAttentivePool(nn.Module):
     def forward(self, ca_kv):
         return self.ca(None, ca_kv).squeeze(1)
 
+
 class SharedAdaLin(nn.Linear):
     def forward(self, cond_BD):
         C = self.weight.shape[0] // 6
@@ -82,7 +83,7 @@ class Infinity(nn.Module):
         shared_aln=False, head_aln=True,    # adaptive norm
         cond_drop_rate=0.1,                 # for classifier-free guidance
         rand_uncond=False,
-        cross_attn_layer_scale=-1., nm0=False, tau=1, cos_attn=True, swiglu=False,
+        cross_attn_layer_scale=-1., nm0=False, tau=1, cos_attn=True, swiglu=False, # Cross-Attention Setting
         raw_scale_schedule=(1, 2, 3, 4, 5, 6, 8, 10, 13, 16),
         head_depth=1,
         top_p=0.0, top_k=0.0,
@@ -104,7 +105,7 @@ class Infinity(nn.Module):
         inference_mode=False,
     ):
         # set hyperparameters
-        self.C = embed_dim
+        self.C = embed_dim # Embedding dimension of the model
         self.inference_mode = inference_mode
         self.apply_spatial_patchify = apply_spatial_patchify
         if self.apply_spatial_patchify:
@@ -112,8 +113,8 @@ class Infinity(nn.Module):
         else:
             self.d_vae = vae_local.embed_dim
         self.use_bit_label = use_bit_label
-        self.codebook_dim = self.d_vae
-        self.V = (self.codebook_dim * 2) if self.use_bit_label else vae_local.vocab_size
+        self.codebook_dim = self.d_vae # Dimension of the codebook vector: or number of dimension in the BSQ space.
+        self.V = (self.codebook_dim * 2) if self.use_bit_label else vae_local.vocab_size # Vocabulary size: or number of codebook vectors in the BSQ space.
         self.bit_mask = vae_local.quantizer.lfq.mask if self.use_bit_label else None
         self.Ct5 = text_channels
         self.depth = depth
@@ -195,12 +196,12 @@ class Infinity(nn.Module):
                 self.cfg_uncond = nn.Parameter(cfg_uncond)
             
             self.text_norm = FastRMSNorm(self.Ct5, elementwise_affine=True, eps=norm_eps)
-            self.text_proj_for_sos = TextAttentivePool(self.Ct5, self.D)
+            self.text_proj_for_sos = TextAttentivePool(self.Ct5, self.D) # Start Token Projection from text embedding to cond embedding
             self.text_proj_for_ca = nn.Sequential(
                 nn.Linear(self.Ct5, self.D),
                 nn.GELU(approximate='tanh'),
                 nn.Linear(self.D, self.D),
-            )
+            ) # Text projection network from Text Embedding to cond embedding for Cross-Attention
         else:   # class-label cond
             if selecting_idx is None:
                 num_classes = 1000
@@ -211,7 +212,9 @@ class Infinity(nn.Module):
             self.D = self.C
             self.class_emb = nn.Embedding(self.num_classes + 1, self.C)
             nn.init.trunc_normal_(self.class_emb.weight.data, mean=0, std=init_std)
-        
+
+
+        # Positional embedding and level embedding for each resolution token map.
         self.pos_start = nn.Parameter(torch.empty(1, self.first_l, self.C))
         nn.init.trunc_normal_(self.pos_start.data, mean=0, std=init_std)
         if self.rope2d_each_sa_layer:
@@ -229,7 +232,11 @@ class Infinity(nn.Module):
         
         # [shared adaptive layernorm mapping network]
         self.shared_ada_lin = nn.Sequential(nn.SiLU(inplace=False), SharedAdaLin(self.D, 6*self.C)) if shared_aln else nn.Identity()
-        
+        # optional learnable offset on the shared adaLN output (gamma1, gamma2, scale1, scale2, shift1, shift2); None = disabled, see enable_ada_offset
+        self.register_parameter('ada_offset', None)
+        self.ada_offset_cond_only = True
+        self.ada_offset_infer_scales = None    # set of scale indices where autoregressive_infer_cfg applies the offset; None = all
+
         # fused norm
         if fused_norm:
             fused_norm_func = fused_ada_rms_norm if rms_norm else fused_ada_layer_norm
@@ -330,7 +337,32 @@ class Infinity(nn.Module):
                                         L = aligned_L)
                 attn_fn_compile_dict[patchs_nums_tuple] = attn_fn
         return attn_fn_compile_dict
-        
+
+    def enable_ada_offset(self, init: Optional[torch.Tensor] = None, cond_only: bool = True) -> nn.Parameter:
+        """
+        Attach a learnable offset (1, 1, 6, C) that is added to the output of shared_ada_lin, i.e. to the 6 modulation vectors
+        (gamma1, gamma2, scale1, scale2, shift1, shift2) shared by every block. The head's own adaLN (head_nm) is untouched.
+        :param init: optional initial value (any shape with 6*C elements); zeros if None
+        :param cond_only: under cfg (batch = [cond; uncond]) only add the offset to the cond half in autoregressive_infer_cfg
+        """
+        assert isinstance(self.shared_ada_lin, nn.Sequential), 'ada_offset requires shared_aln=True'
+        device = self.pos_start.device
+        offset = torch.zeros(1, 1, 6, self.C, device=device) if init is None else init.detach().reshape(1, 1, 6, self.C).to(device=device, dtype=torch.float32).clone()
+        self.ada_offset = nn.Parameter(offset, requires_grad=True)
+        self.ada_offset_cond_only = cond_only
+        return self.ada_offset
+
+    def disable_ada_offset(self):
+        self.ada_offset = None
+
+    def apply_ada_offset(self, cond_BD_or_gss: torch.Tensor, B: Optional[int] = None) -> torch.Tensor:
+        if self.ada_offset is None:
+            return cond_BD_or_gss
+        offset = self.ada_offset.to(cond_BD_or_gss.dtype)
+        if B is not None and self.ada_offset_cond_only and cond_BD_or_gss.shape[0] > B:
+            return torch.cat((cond_BD_or_gss[:B] + offset, cond_BD_or_gss[B:]), dim=0)
+        return cond_BD_or_gss + offset
+
     def get_logits(self, h: torch.Tensor, cond_BD: Optional[torch.Tensor]):
         """
         :param h: hidden_state, shaped (B or batch_size, L or seq_len, C or hidden_dim)
@@ -392,9 +424,13 @@ class Infinity(nn.Module):
             kv_compact = self.text_proj_for_ca(kv_compact).contiguous()
             kv_compact[0, 0] += must_on_graph
             ca_kv = kv_compact, cu_seqlens_k, max_seqlen_k
+
             
+            # Decompose 6 gamma, shift, scale.
             cond_BD_or_gss = self.shared_ada_lin(cond_BD).contiguous()  # gss: gamma, scale, shift; cond_BD_or_gss should be float32
-            
+            cond_BD_or_gss = self.apply_ada_offset(cond_BD_or_gss)      # no-op unless enable_ada_offset() was called
+
+
             sos = sos.unsqueeze(1).expand(B, 1, -1) + self.pos_start.expand(B, 1, -1)
             x_BLC = torch.cat((sos, self.word_embed(self.norm0_ve(x_BLC_wo_prefix))), dim=1)
 
@@ -501,13 +537,15 @@ class Infinity(nn.Module):
             bs = B
 
         kv_compact = self.text_norm(kv_compact)
-        sos = cond_BD = self.text_proj_for_sos((kv_compact, cu_seqlens_k, max_seqlen_k)) # sos shape: [2, 4096]
+        sos = cond_BD = self.text_proj_for_sos((kv_compact, cu_seqlens_k, max_seqlen_k)) # sos shape: [2, 4096] project to K and V of SOS  for Cross-Attention.
         kv_compact = self.text_proj_for_ca(kv_compact) # kv_compact shape: [304, 4096]
         ca_kv = kv_compact, cu_seqlens_k, max_seqlen_k
-        last_stage = sos.unsqueeze(1).expand(bs, 1, -1) + self.pos_start.expand(bs, 1, -1)
+        last_stage = sos.unsqueeze(1).expand(bs, 1, -1) + self.pos_start.expand(bs, 1, -1) # Last stage shape: [2, 1, 4096]
 
         with torch.amp.autocast('cuda', enabled=False):
             cond_BD_or_gss = self.shared_ada_lin(cond_BD.float()).float().contiguous()
+            gss_wo_offset = cond_BD_or_gss
+            cond_BD_or_gss = self.apply_ada_offset(cond_BD_or_gss, B=B)   # with cfg, only the first B (cond) rows get the offset by default
         accu_BChw, cur_L, ret = None, 0, []  # current length, list of reconstructed images
         idx_Bl_list, idx_Bld_list = [], []
 
@@ -551,6 +589,7 @@ class Infinity(nn.Module):
 
             # assert self.attn_bias_for_masking[:, :, last_L:cur_L, :cur_L].sum() == 0, f'AR with {(self.attn_bias_for_masking[:, :, last_L:cur_L, :cur_L] != 0).sum()} / {self.attn_bias_for_masking[:, :, last_L:cur_L, :cur_L].numel()} mask item'
             layer_idx = 0
+            gss_si = cond_BD_or_gss if (self.ada_offset_infer_scales is None or si in self.ada_offset_infer_scales) else gss_wo_offset
             for block_idx, b in enumerate(self.block_chunks):
                 # last_stage shape: [4, 1, 2048], cond_BD_or_gss.shape: [4, 1, 6, 2048], ca_kv[0].shape: [64, 2048], ca_kv[1].shape [5], ca_kv[2]: int
                 if self.add_lvl_embeding_only_first_block and block_idx == 0:
@@ -559,7 +598,7 @@ class Infinity(nn.Module):
                     last_stage = self.add_lvl_embeding(last_stage, si, scale_schedule, need_to_pad=need_to_pad)
                 
                 for m in b.module:
-                    last_stage = m(x=last_stage, cond_BD=cond_BD_or_gss, ca_kv=ca_kv, attn_bias_or_two_vector=None, attn_fn=attn_fn, scale_schedule=scale_schedule, rope2d_freqs_grid=self.rope2d_freqs_grid, scale_ind=si)
+                    last_stage = m(x=last_stage, cond_BD=gss_si, ca_kv=ca_kv, attn_bias_or_two_vector=None, attn_fn=attn_fn, scale_schedule=scale_schedule, rope2d_freqs_grid=self.rope2d_freqs_grid, scale_ind=si)
                     if (cfg != 1) and (layer_idx in abs_cfg_insertion_layers):
                         # print(f'add cfg={cfg} on {layer_idx}-th layer output')
                         last_stage = cfg * last_stage[:B] + (1-cfg) * last_stage[B:]
