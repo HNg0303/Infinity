@@ -2,6 +2,7 @@
 Optimize a learnable offset on Infinity's shared adaLN modulation (gamma1, gamma2, scale1, scale2, shift1, shift2)
 so that the frozen model, conditioned on its own null text embedding (cfg_uncond -> text_norm -> text_proj_for_sos ->
 shared_ada_lin, then + offset), reconstructs one target image or a set of images of one subject (DreamBooth-style).
+By default every scale gets its own offset (S, 1, 6, C) (--offset_mode per_scale); --offset_mode shared uses one (1, 1, 6, C).
 The offset is trained with the same bitwise cross-entropy loss as trainer.py (teacher forcing), optionally restricted to
 some scales (--loss_scales), on randomly shuffled mini-batches of the training images.
 
@@ -174,7 +175,8 @@ def optimize(args, infinity, vae, device):
         apply_spatial_patchify=args.apply_spatial_patchify, debug_bsc=0))
 
     freeze_for_offset_training(infinity, args.grad_checkpointing)
-    offset = infinity.enable_ada_offset(cond_only=True)  # after freezing, so it is the only trainable tensor
+    num_offset_scales = len(scale_schedule) if args.offset_mode == 'per_scale' else 1
+    offset = infinity.enable_ada_offset(cond_only=True, num_scales=num_offset_scales)  # after freezing, so it is the only trainable tensor
     optimizer = torch.optim.Adam([offset], lr=args.lr, weight_decay=args.weight_decay)
     print(f'[offset] trainable params: {offset.numel()} (shape {tuple(offset.shape)}), backbone frozen: {sum(p.requires_grad for p in infinity.parameters()) == 1}, '
           f'batch_size={args.batch_size} x grad_accum={args.grad_accum}')
@@ -204,14 +206,17 @@ def optimize(args, infinity, vae, device):
 
         log.append((it, it_loss, it_acc))
         if it % args.log_every == 0 or it == args.iters - 1:
-            norms = offset.detach().norm(dim=-1).flatten().tolist()  # per (gamma1, gamma2, scale1, scale2, shift1, shift2)
+            if offset.shape[0] == 1:  # norm per (gamma1, gamma2, scale1, scale2, shift1, shift2)
+                norms, what = offset.detach().norm(dim=-1).flatten().tolist(), '|offset| (g1,g2,s1,s2,b1,b2)'
+            else:                     # norm per scale
+                norms, what = offset.detach().flatten(1).norm(dim=-1).tolist(), '|offset| per scale'
             print(f'[it {it:4d}/{args.iters}] loss={it_loss:.4f} bit_acc={it_acc * 100:.2f}% '
-                  f'|offset|=[{", ".join(f"{n:.3f}" for n in norms)}] {time.time() - stt:.2f}s/it', flush=True)
+                  f'{what}=[{", ".join(f"{n:.3f}" for n in norms)}] {time.time() - stt:.2f}s/it', flush=True)
 
     if args.save_offset:
         os.makedirs(osp.dirname(osp.abspath(args.save_offset)), exist_ok=True)
         torch.save({
-            'ada_offset': offset.detach().cpu(), 'null_len': args.null_len, 'pn': args.pn, 'h_div_w_template': h_div_w_template,
+            'ada_offset': offset.detach().cpu(), 'offset_mode': args.offset_mode, 'null_len': args.null_len, 'pn': args.pn, 'h_div_w_template': h_div_w_template,
             'images': paths, 'loss_scales': loss_scales, 'batch_size': args.batch_size, 'grad_accum': args.grad_accum,
             'iters': args.iters, 'lr': args.lr, 'log': log,
         }, args.save_offset)
@@ -231,7 +236,7 @@ def set_offset_infer_scales(infinity, spec, num_scales):
 
 def infer(args, infinity, vae, device):
     ckpt = torch.load(args.offset_path, map_location='cpu')
-    infinity.enable_ada_offset(init=ckpt['ada_offset'] * args.offset_scale, cond_only=True)
+    infinity.enable_ada_offset(init=ckpt['ada_offset'] * args.offset_scale, cond_only=True)  # shared or per-scale, from the saved shape
     infinity.requires_grad_(False)
     null_len = ckpt.get('null_len', args.null_len)
     h_div_w = args.h_div_w_template if args.h_div_w_template > 0 else ckpt.get('h_div_w_template', 1.0)
@@ -282,6 +287,7 @@ if __name__ == '__main__':
     parser.add_argument('--reg_l2', type=float, default=0., help='extra L2 penalty on the offset')
     parser.add_argument('--label_smooth', type=float, default=0.)
     parser.add_argument('--reweight_loss_by_scale', type=int, default=0, choices=[0, 1])
+    parser.add_argument('--offset_mode', type=str, default='per_scale', choices=['per_scale', 'shared'], help='one offset per scale (S,1,6,C) or one for all scales (1,1,6,C)')
     parser.add_argument('--loss_scales', type=str, default='all', help="scales whose tokens are in the loss and backward, e.g. '0-5' (early scales), '0,2,4', 'all'")
     parser.add_argument('--offset_infer_scales', type=str, default='all', help="scales where the offset is applied at inference, same syntax as --loss_scales")
     parser.add_argument('--noise_apply_layers', type=int, default=0, help='bitwise self-correction noise on the first N scales (0 = pure teacher forcing)')

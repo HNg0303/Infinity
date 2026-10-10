@@ -338,16 +338,24 @@ class Infinity(nn.Module):
                 attn_fn_compile_dict[patchs_nums_tuple] = attn_fn
         return attn_fn_compile_dict
 
-    def enable_ada_offset(self, init: Optional[torch.Tensor] = None, cond_only: bool = True) -> nn.Parameter:
+    def enable_ada_offset(self, init: Optional[torch.Tensor] = None, cond_only: bool = True, num_scales: Optional[int] = None) -> nn.Parameter:
         """
-        Attach a learnable offset (1, 1, 6, C) that is added to the output of shared_ada_lin, i.e. to the 6 modulation vectors
+        Attach a learnable offset (S, 1, 6, C) that is added to the output of shared_ada_lin, i.e. to the 6 modulation vectors
         (gamma1, gamma2, scale1, scale2, shift1, shift2) shared by every block. The head's own adaLN (head_nm) is untouched.
-        :param init: optional initial value (any shape with 6*C elements); zeros if None
+        S == 1: one offset for all scales; S > 1: row si is used for the tokens of scale si (scales >= S get no offset).
+        :param init: optional initial value with 6*C (shared, repeated to every scale) or S*6*C elements; zeros if None
         :param cond_only: under cfg (batch = [cond; uncond]) only add the offset to the cond half in autoregressive_infer_cfg
+        :param num_scales: S; default: inferred from init, else 1
         """
         assert isinstance(self.shared_ada_lin, nn.Sequential), 'ada_offset requires shared_aln=True'
         device = self.pos_start.device
-        offset = torch.zeros(1, 1, 6, self.C, device=device) if init is None else init.detach().reshape(1, 1, 6, self.C).to(device=device, dtype=torch.float32).clone()
+        if init is None:
+            offset = torch.zeros(num_scales or 1, 1, 6, self.C, device=device)
+        else:
+            offset = init.detach().reshape(-1, 1, 6, self.C).to(device=device, dtype=torch.float32).clone()
+            if num_scales is not None and offset.shape[0] != num_scales:
+                assert offset.shape[0] == 1, f'init has {offset.shape[0]} scales, expected 1 or {num_scales}'
+                offset = offset.repeat(num_scales, 1, 1, 1)
         self.ada_offset = nn.Parameter(offset, requires_grad=True)
         self.ada_offset_cond_only = cond_only
         return self.ada_offset
@@ -355,12 +363,31 @@ class Infinity(nn.Module):
     def disable_ada_offset(self):
         self.ada_offset = None
 
-    def apply_ada_offset(self, cond_BD_or_gss: torch.Tensor, B: Optional[int] = None) -> torch.Tensor:
+    def apply_ada_offset(self, cond_BD_or_gss: torch.Tensor, B: Optional[int] = None, si: Optional[int] = None, scale_schedule=None, seq_len: int = 0) -> torch.Tensor:
+        """
+        cond_BD_or_gss: (bs, 1, 6, C)
+        - shared offset (S == 1): returns (bs, 1, 6, C)
+        - per-scale offset, inference (si given): adds row si, returns (bs, 1, 6, C)
+        - per-scale offset, teacher-forcing forward (scale_schedule given): one modulation per token, returns (bs, seq_len, 6, C);
+          padded tokens beyond the schedule reuse the last scale's row
+        """
         if self.ada_offset is None:
             return cond_BD_or_gss
         offset = self.ada_offset.to(cond_BD_or_gss.dtype)
+        S = offset.shape[0]
+        if S == 1:
+            pass
+        elif si is not None:
+            if si >= S:
+                return cond_BD_or_gss
+            offset = offset[si:si+1]
+        else:
+            assert scale_schedule is not None and len(scale_schedule) <= S, f'per-scale ada_offset has {S} scales, forward uses {None if scale_schedule is None else len(scale_schedule)}'
+            idx = torch.cat([torch.full((int(np.prod(pn)),), i, dtype=torch.long) for i, pn in enumerate(scale_schedule)])
+            idx = F.pad(idx, (0, max(seq_len - idx.numel(), 0)), value=len(scale_schedule) - 1).to(offset.device)
+            offset = offset[idx, 0].unsqueeze(0)    # 1, L, 6, C
         if B is not None and self.ada_offset_cond_only and cond_BD_or_gss.shape[0] > B:
-            return torch.cat((cond_BD_or_gss[:B] + offset, cond_BD_or_gss[B:]), dim=0)
+            return torch.cat((cond_BD_or_gss[:B] + offset, cond_BD_or_gss[B:].expand(-1, offset.shape[1], -1, -1)), dim=0)
         return cond_BD_or_gss + offset
 
     def get_logits(self, h: torch.Tensor, cond_BD: Optional[torch.Tensor]):
@@ -428,7 +455,6 @@ class Infinity(nn.Module):
             
             # Decompose 6 gamma, shift, scale.
             cond_BD_or_gss = self.shared_ada_lin(cond_BD).contiguous()  # gss: gamma, scale, shift; cond_BD_or_gss should be float32
-            cond_BD_or_gss = self.apply_ada_offset(cond_BD_or_gss)      # no-op unless enable_ada_offset() was called
 
 
             sos = sos.unsqueeze(1).expand(B, 1, -1) + self.pos_start.expand(B, 1, -1)
@@ -458,7 +484,10 @@ class Infinity(nn.Module):
                     attn_bias[0, 0, l_end:, 0] = 0
                     x_BLC = F.pad(x_BLC, (0, 0, 0, need_to_pad))
                 attn_bias_or_two_vector = attn_bias.type_as(x_BLC).to(x_BLC.device)
-        
+
+            # no-op unless enable_ada_offset() was called; a per-scale offset makes the modulation per token: (B, L, 6, C)
+            cond_BD_or_gss = self.apply_ada_offset(cond_BD_or_gss, scale_schedule=scale_schedule, seq_len=x_BLC.shape[1])
+
         if self.use_flex_attn:
             attn_fn = self.attn_fn_compile_dict[tuple(scale_schedule)]
         else:
@@ -544,8 +573,7 @@ class Infinity(nn.Module):
 
         with torch.amp.autocast('cuda', enabled=False):
             cond_BD_or_gss = self.shared_ada_lin(cond_BD.float()).float().contiguous()
-            gss_wo_offset = cond_BD_or_gss
-            cond_BD_or_gss = self.apply_ada_offset(cond_BD_or_gss, B=B)   # with cfg, only the first B (cond) rows get the offset by default
+        gss_wo_offset = cond_BD_or_gss   # the offset (if any) is added per scale in the loop below
         accu_BChw, cur_L, ret = None, 0, []  # current length, list of reconstructed images
         idx_Bl_list, idx_Bld_list = [], []
 
@@ -589,7 +617,10 @@ class Infinity(nn.Module):
 
             # assert self.attn_bias_for_masking[:, :, last_L:cur_L, :cur_L].sum() == 0, f'AR with {(self.attn_bias_for_masking[:, :, last_L:cur_L, :cur_L] != 0).sum()} / {self.attn_bias_for_masking[:, :, last_L:cur_L, :cur_L].numel()} mask item'
             layer_idx = 0
-            gss_si = cond_BD_or_gss if (self.ada_offset_infer_scales is None or si in self.ada_offset_infer_scales) else gss_wo_offset
+            if self.ada_offset_infer_scales is None or si in self.ada_offset_infer_scales:
+                gss_si = self.apply_ada_offset(gss_wo_offset, B=B, si=si)   # with cfg, only the first B (cond) rows get the offset by default
+            else:
+                gss_si = gss_wo_offset
             for block_idx, b in enumerate(self.block_chunks):
                 # last_stage shape: [4, 1, 2048], cond_BD_or_gss.shape: [4, 1, 6, 2048], ca_kv[0].shape: [64, 2048], ca_kv[1].shape [5], ca_kv[2]: int
                 if self.add_lvl_embeding_only_first_block and block_idx == 0:
