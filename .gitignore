@@ -45,3 +45,4 @@ checkpoints
 ref.py
 wandb
 .DS_Store
+.venv/

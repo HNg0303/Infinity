@@ -111,6 +111,10 @@ def freeze_for_offset_training(infinity, grad_checkpointing):
     """Freeze the backbone; use train() only so 'full-block' checkpointing is active, but keep drop-path / dropout off."""
     infinity.requires_grad_(False)
     infinity.cond_drop_rate = 0.
+    set_train_mode(infinity, grad_checkpointing)
+
+
+def set_train_mode(infinity, grad_checkpointing):
     if grad_checkpointing:
         infinity.train()
         for m in infinity.modules():
@@ -181,6 +185,16 @@ def optimize(args, infinity, vae, device):
     print(f'[offset] trainable params: {offset.numel()} (shape {tuple(offset.shape)}), backbone frozen: {sum(p.requires_grad for p in infinity.parameters()) == 1}, '
           f'batch_size={args.batch_size} x grad_accum={args.grad_accum}')
 
+    def save_offset(path, iters_done):
+        os.makedirs(osp.dirname(osp.abspath(path)), exist_ok=True)
+        torch.save({
+            'ada_offset': offset.detach().cpu(), 'offset_mode': args.offset_mode, 'null_len': args.null_len, 'pn': args.pn, 'h_div_w_template': h_div_w_template,
+            'images': paths, 'loss_scales': loss_scales, 'batch_size': args.batch_size, 'grad_accum': args.grad_accum,
+            'iters': iters_done, 'lr': args.lr, 'log': list(log),
+        }, path)
+        print(f'[saved] offset (it {iters_done}) -> {path}')
+
+    targets = reference_row(inps[:len(paths)])  # bottom row of every saved grid: the training images (no h-flips)
     batches = shuffled_batches(len(raw_features), args.batch_size, args.seed)
     log = []
     for it in range(args.iters):
@@ -212,22 +226,25 @@ def optimize(args, infinity, vae, device):
                 norms, what = offset.detach().flatten(1).norm(dim=-1).tolist(), '|offset| per scale'
             print(f'[it {it:4d}/{args.iters}] loss={it_loss:.4f} bit_acc={it_acc * 100:.2f}% '
                   f'{what}=[{", ".join(f"{n:.3f}" for n in norms)}] {time.time() - stt:.2f}s/it', flush=True)
+        if args.save_offset_every > 0 and args.save_offset and (it + 1) % args.save_offset_every == 0 and it + 1 < args.iters:
+            stem, ext = osp.splitext(args.save_offset)
+            save_offset(f'{stem}_it{it + 1:05d}{ext}', it + 1)
+        if args.sample_every > 0 and args.save_file and (it + 1) % args.sample_every == 0 and it + 1 < args.iters:
+            stem, ext = osp.splitext(args.save_file)
+            set_offset_infer_scales(infinity, args.offset_infer_scales, len(scale_schedule))
+            samples = [generate(infinity, vae, get_null_text_cond(infinity, 1, args.null_len), scale_schedule, args, args.seed + i)
+                       for i in range(args.num_samples)]  # same seeds every time, so snapshots are comparable
+            save_rows(f'{stem}_progress/it{it + 1:05d}{ext}', [samples, targets])
+            set_train_mode(infinity, args.grad_checkpointing)  # generate() switched to eval()
 
     if args.save_offset:
-        os.makedirs(osp.dirname(osp.abspath(args.save_offset)), exist_ok=True)
-        torch.save({
-            'ada_offset': offset.detach().cpu(), 'offset_mode': args.offset_mode, 'null_len': args.null_len, 'pn': args.pn, 'h_div_w_template': h_div_w_template,
-            'images': paths, 'loss_scales': loss_scales, 'batch_size': args.batch_size, 'grad_accum': args.grad_accum,
-            'iters': args.iters, 'lr': args.lr, 'log': log,
-        }, args.save_offset)
-        print(f'[saved] offset -> {args.save_offset}')
+        save_offset(args.save_offset, args.iters)
 
     if args.save_file:
         set_offset_infer_scales(infinity, args.offset_infer_scales, len(scale_schedule))
         samples = [generate(infinity, vae, get_null_text_cond(infinity, 1, args.null_len), scale_schedule, args, args.seed + i)
                    for i in range(args.num_samples)]
-        targets = [((x.permute(1, 2, 0) + 1) / 2 * 255).clamp(0, 255).byte().numpy()[:, :, ::-1] for x in inps[:len(paths)]]
-        save_rows(args.save_file, [samples, targets[:max(args.num_samples, 1)]])
+        save_rows(args.save_file, [samples, targets])
 
 
 def set_offset_infer_scales(infinity, spec, num_scales):
@@ -251,7 +268,15 @@ def infer(args, infinity, vae, device):
     for prompt, text_cond_tuple in conds:
         print(f'[infer] offset={args.offset_path} x{args.offset_scale} on scales {args.offset_infer_scales}, prompt={prompt!r}, cfg={args.cfg}')
         rows.append([generate(infinity, vae, text_cond_tuple, scale_schedule, args, args.seed + i) for i in range(args.num_samples)])
+    if ckpt.get('images'):  # bottom row: the images the offset was trained on
+        tgt_h, tgt_w = scale_schedule[-1][1] * 16, scale_schedule[-1][2] * 16
+        rows.append(reference_row([transform(Image.open(p).convert('RGB'), tgt_h, tgt_w) for p in ckpt['images']]))
     save_rows(args.save_file, rows)
+
+
+def reference_row(inps):
+    """[-1, 1] CHW tensors -> HW3 uint8 BGR, the format of generate()'s samples"""
+    return [((x.permute(1, 2, 0) + 1) / 2 * 255).clamp(0, 255).byte().numpy()[:, :, ::-1] for x in inps]
 
 
 def save_rows(path, rows):
@@ -277,7 +302,7 @@ if __name__ == '__main__':
     add_common_arguments(parser)
     parser.add_argument('--mode', type=str, default='optimize', choices=['optimize', 'infer'])
     parser.add_argument('--images', '--image', type=str, default='', help='optimize mode: an image, a folder, or a comma-separated list')
-    parser.add_argument('--null_len', type=int, default=1, help='length of the null text cfg_uncond[:null_len]; 1 = the uncond branch of an empty prompt')
+    parser.add_argument('--null_len', type=int, default=32, help='length of the null text cfg_uncond[:null_len]; 1 is out of distribution (cond-drop replaced whole captions, so the model saw >=8-token nulls), >=8 all give the same TF accuracy')
     parser.add_argument('--iters', type=int, default=500, help='optimizer steps')
     parser.add_argument('--batch_size', type=int, default=1, help='images per forward/backward, drawn from a shuffled permutation each epoch')
     parser.add_argument('--grad_accum', type=int, default=1, help='micro-batches accumulated per optimizer step (effective batch = batch_size * grad_accum)')
@@ -294,7 +319,9 @@ if __name__ == '__main__':
     parser.add_argument('--noise_apply_strength', type=float, default=0.3)
     parser.add_argument('--grad_checkpointing', type=int, default=1, choices=[0, 1])
     parser.add_argument('--log_every', type=int, default=10)
+    parser.add_argument('--sample_every', type=int, default=0, help='also sample every N steps to <save_file stem>_progress/ (0 = only at the end)')
     parser.add_argument('--save_offset', type=str, default='./ada_offset.pth')
+    parser.add_argument('--save_offset_every', type=int, default=0, help='also save the offset every N steps to <save_offset stem>_itXXXXX.pth (0 = only at the end)')
     parser.add_argument('--offset_path', type=str, default='', help='learned offset (infer mode)')
     parser.add_argument('--offset_scale', type=float, default=1.0, help='multiply the learned offset at inference')
     parser.add_argument('--prompt', type=str, default='', help="infer mode: prompt(s) separated by '|' the offset is added on top of (default: null text)")
